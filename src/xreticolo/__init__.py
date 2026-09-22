@@ -17,9 +17,9 @@ and a handful of tabulated material optical constants.
 functions are thin, tested convenience wrappers around the ones used most.
 """
 
-from ._octave import OctaveError, call
+from ._octave import OctaveError, OctaveSession, call
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 
 def vls_trajectory(E_eV, E0_eV, g_lpm, p_m, q_m, cff):
@@ -46,6 +46,7 @@ def efficiency_lamellarx(g_lpm, thickness_m, E_eV, grazing_angle_rad, material, 
 __all__ = [
     "call",
     "OctaveError",
+    "OctaveSession",
     "vls_trajectory",
     "efficiency_blazedx",
     "efficiency_lamellarx",

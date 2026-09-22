@@ -1,11 +1,18 @@
 """Low-level bridge to Blazr.m running under GNU Octave.
 
 Requires Octave on PATH (tested with 10.3.0): brew install octave
+
+Calls are piped to a single, lazily-started, long-lived octave-cli process
+rather than spawning a fresh one per call: process startup is the dominant
+cost (~0.5-1s) compared to the actual RCWA computation, so reusing one
+process turns a "1 second per point" sweep into "1 second, then fast".
 """
 
+import atexit
 import json
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
@@ -38,7 +45,7 @@ class OctaveError(RuntimeError):
 
 
 def _to_octave_literal(value):
-    """Convert a Python value to an Octave/MATLAB literal for use in --eval'd code."""
+    """Convert a Python value to an Octave/MATLAB literal for use in evaluated code."""
     if isinstance(value, str):
         return "'" + value.replace("'", "''") + "'"
     if isinstance(value, bool):
@@ -50,27 +57,9 @@ def _to_octave_literal(value):
     raise TypeError(f"unsupported argument type for Octave call: {type(value)!r}")
 
 
-def _extract(stdout, marker):
-    for line in stdout.splitlines():
-        if line.startswith(marker):
-            return line[len(marker):]
-    return None
-
-
-def call(method, *args, nargout=1):
-    """Call Blazr.<method>(*args) in Octave.
-
-    Returns the single output value if nargout == 1, otherwise a tuple of
-    nargout values. Numeric outputs come back as Python floats or (nested)
-    lists, matching however Blazr.<method> shapes them.
-    """
-    if shutil.which("octave-cli") is None:
-        raise OctaveError(
-            "octave-cli not found on PATH. Install Octave, e.g. `brew install octave`."
-        )
-
+def _build_call_code(method, args, nargout):
     arg_list = ", ".join(_to_octave_literal(a) for a in args)
-    code = f"""
+    return f"""
 try
   call_args = {{{arg_list}}};
   outs = cell(1, {nargout});
@@ -83,25 +72,107 @@ try
 catch err
   printf('{_ERROR_MARKER}%s\\n', strrep(err.message, "\\n", " "));
 end
+fflush(stdout);
 """
-    result = subprocess.run(
-        ["octave-cli", "--no-gui", "--eval", _SUPPRESS_WARNINGS + _SETUP_PATH + code],
-        cwd=_RESOURCES_DIR,
-        capture_output=True,
-        text=True,
-    )
 
-    error = _extract(result.stdout, _ERROR_MARKER)
-    if error is not None:
-        raise OctaveError(f"Blazr.{method} failed in Octave: {error.strip()}")
 
-    payload = _extract(result.stdout, _RESULT_MARKER)
-    if payload is None:
-        raise OctaveError(
-            f"no result from Blazr.{method} (octave exit {result.returncode})\n"
-            f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+class OctaveSession:
+    """A persistent octave-cli process that Blazr.* calls are piped to.
+
+    Can be used as a context manager for explicit lifetime control:
+
+        with OctaveSession() as session:
+            eta = session.call("efficiency_lamellar", ...)
+
+    Otherwise, `xreticolo.call(...)` lazily starts and reuses one shared
+    session for the lifetime of the process.
+    """
+
+    def __init__(self):
+        if shutil.which("octave-cli") is None:
+            raise OctaveError(
+                "octave-cli not found on PATH. Install Octave, e.g. `brew install octave`."
+            )
+        self._lock = threading.Lock()
+        self._proc = subprocess.Popen(
+            ["octave-cli", "--no-gui", "--norc", "--quiet"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=_RESOURCES_DIR,
         )
+        self._proc.stdin.write(_SUPPRESS_WARNINGS + _SETUP_PATH)
+        self._proc.stdin.flush()
 
-    values = json.loads(payload)
-    outputs = [values[f"out{i}"] for i in range(1, nargout + 1)]
-    return outputs[0] if nargout == 1 else tuple(outputs)
+    def is_alive(self):
+        return self._proc.poll() is None
+
+    def call(self, method, *args, nargout=1):
+        with self._lock:
+            if not self.is_alive():
+                raise OctaveError("octave process is no longer running")
+
+            self._proc.stdin.write(_build_call_code(method, args, nargout))
+            self._proc.stdin.flush()
+
+            while True:
+                line = self._proc.stdout.readline()
+                if line == "":
+                    raise OctaveError(
+                        f"octave process exited unexpectedly while running Blazr.{method}"
+                    )
+                if line.startswith(_ERROR_MARKER):
+                    error = line[len(_ERROR_MARKER):].strip()
+                    raise OctaveError(f"Blazr.{method} failed in Octave: {error}")
+                if line.startswith(_RESULT_MARKER):
+                    payload = line[len(_RESULT_MARKER):]
+                    values = json.loads(payload)
+                    outputs = [values[f"out{i}"] for i in range(1, nargout + 1)]
+                    return outputs[0] if nargout == 1 else tuple(outputs)
+                # anything else (warnings, stray output) is discarded
+
+    def close(self):
+        if self._proc.poll() is not None:
+            return
+        try:
+            self._proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            self._proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+
+_default_session = None
+_default_session_lock = threading.Lock()
+
+
+def _get_default_session():
+    global _default_session
+    with _default_session_lock:
+        if _default_session is None or not _default_session.is_alive():
+            _default_session = OctaveSession()
+            atexit.register(_default_session.close)
+        return _default_session
+
+
+def call(method, *args, nargout=1):
+    """Call Blazr.<method>(*args) in Octave.
+
+    Uses a lazily-started, process-wide persistent Octave session, so only
+    the first call pays Octave's startup cost.
+
+    Returns the single output value if nargout == 1, otherwise a tuple of
+    nargout values. Numeric outputs come back as Python floats or (nested)
+    lists, matching however Blazr.<method> shapes them.
+    """
+    return _get_default_session().call(method, *args, nargout=nargout)
